@@ -26,7 +26,7 @@ class TTSRequest(BaseModel):
     voice: str = "en-US-GuyNeural"
 
 class ReelRequest(BaseModel):
-    text: str
+    script: str
     mood: str
     voice: str = "en-US-GuyNeural"
 
@@ -137,8 +137,10 @@ async def tts(request: TTSRequest, background_tasks: BackgroundTasks):
 
 @app.post("/reel")
 async def create_reel(request: ReelRequest, background_tasks: BackgroundTasks):
-    if not request.text.strip():
-        return JSONResponse({"error": "Text is required"}, status_code=400)
+    print(f"Received reel request: script={request.script}, mood={request.mood}, voice={request.voice}")
+    
+    if not request.script.strip():
+        return JSONResponse({"error": "Script is required"}, status_code=400)
     if not request.mood.strip():
         return JSONResponse({"error": "Mood is required"}, status_code=400)
     if not request.voice.strip():
@@ -153,7 +155,7 @@ async def create_reel(request: ReelRequest, background_tasks: BackgroundTasks):
 
     try:
         # 1. Build prompt and download image from Pollinations.
-        prompt = build_image_prompt(request.text, request.mood)
+        prompt = build_image_prompt(request.script, request.mood)
         encoded_prompt = urllib.parse.quote(prompt)
         image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1080&height=1920&nologo=true"
 
@@ -185,17 +187,17 @@ async def create_reel(request: ReelRequest, background_tasks: BackgroundTasks):
             f.write(resp.content)
 
         # 2. Generate TTS narration.
-        communicate = edge_tts.Communicate(request.text, request.voice)
+        communicate = edge_tts.Communicate(request.script, request.voice)
         await communicate.save(audio_path)
 
         if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
             raise HTTPException(status_code=500, detail="TTS generation produced an empty audio file")
 
         # 3. Estimate subtitle timing from the generated audio.
-        duration = get_audio_duration(audio_path, request.text)
+        duration = get_audio_duration(audio_path, request.script)
 
         # 4. Create SRT subtitles.
-        create_srt(request.text, duration, srt_path)
+        create_srt(request.script, duration, srt_path)
 
         # 5. Create vertical MP4 with a still background, narration, and burned subtitles.
         subtitle_filter = (
