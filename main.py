@@ -33,6 +33,8 @@ class ReelRequest(BaseModel):
     script: str
     mood: str
     voice: str = "en-US-GuyNeural"
+    rate: str = "-10%"
+    pitch: str = "-5Hz"
 
 def cleanup_files(*files):
     for file in files:
@@ -133,32 +135,41 @@ async def create_reel(request: ReelRequest, background_tasks: BackgroundTasks):
     output_path = os.path.join(temp_dir, "reel.mp4")
 
     try:
-        # 1. Image Generation (Pollinations)
-        prompt = f"vertical 9:16 cinematic motivational, mood: {request.mood}, {request.script[:100]}"
-        encoded_prompt = urllib.parse.quote(prompt)
+        # 1. Image Generation (Optimized Prompt + Random Seed)
+        refined_prompt = (
+            f"Professional cinematic vertical 9:16 photography, {request.mood} mood, "
+            f"{request.script[:120]}, high detail, 4k, photorealistic, aesthetic composition, "
+            f"dramatic lighting, depth of field"
+        )
+        encoded_prompt = urllib.parse.quote(refined_prompt)
+        seed = uuid.uuid4().int % 10000
         async with httpx.AsyncClient() as client:
-            # Reduced resolution for memory efficiency (720x1280 instead of 1080x1920)
-            resp = await client.get(f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=720&height=1280&nologo=true", timeout=60.0)
+            resp = await client.get(f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=720&height=1280&nologo=true&seed={seed}", timeout=60.0)
             if resp.status_code != 200: raise Exception("Image generation failed")
             with open(image_path, "wb") as f: f.write(resp.content)
 
-        # 2. TTS Generation
-        communicate = edge_tts.Communicate(request.script, request.voice)
+        # 2. TTS Generation (Adjusted Pace and Pitch)
+        # Using parameters from request with fallbacks
+        rate = request.rate if request.rate else "-10%"
+        pitch = request.pitch if request.pitch else "-5Hz"
+
+        communicate = edge_tts.Communicate(request.script, request.voice, rate=rate, pitch=pitch)
         await communicate.save(audio_path)
         duration = get_audio_duration(audio_path, request.script)
 
         # 3. Subtitles (SRT)
         create_srt(request.script, duration, srt_path)
 
-        # 4. Video Assembly (FFmpeg)
-        # Optimized for Render Free Tier (512MB RAM)
+        # 4. Video Assembly (FFmpeg with Visual Optimization)
         ffmpeg_path = os.path.join(os.getcwd(), "ffmpeg_bin", "ffmpeg")
         if not os.path.exists(ffmpeg_path):
-            ffmpeg_path = 'ffmpeg' # Fallback to system path
+            ffmpeg_path = 'ffmpeg'
 
+        # eq filter darkens background slightly to make text pop; MarginV moves text up
         video_filter = (
             "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,"
-            "subtitles=subtitles.srt:force_style='Alignment=2,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=1'"
+            "eq=brightness=-0.1:contrast=1.1,"
+            "subtitles=subtitles.srt:force_style='Alignment=2,FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=1,MarginV=140'"
         )
         cmd = [
             ffmpeg_path, '-loop', '1', '-i', 'background.jpg', '-i', 'narration.mp3',
