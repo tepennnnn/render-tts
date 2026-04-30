@@ -35,6 +35,7 @@ class ReelRequest(BaseModel):
     voice: str = "en-US-GuyNeural"
     rate: str = "-10%"
     pitch: str = "-5Hz"
+    image_description: str = None
 
 def cleanup_files(*files):
     for file in files:
@@ -136,11 +137,15 @@ async def create_reel(request: ReelRequest, background_tasks: BackgroundTasks):
 
     try:
         # 1. Image Generation (Optimized Prompt + Random Seed)
-        refined_prompt = (
-            f"Professional cinematic vertical 9:16 photography, {request.mood} mood, "
-            f"{request.script[:120]}, high detail, 4k, photorealistic, aesthetic composition, "
-            f"dramatic lighting, depth of field"
-        )
+        if request.image_description and request.image_description.strip():
+            refined_prompt = f"Professional cinematic vertical 9:16 photography, {request.image_description}, high detail, 4k, photorealistic, aesthetic composition"
+        else:
+            refined_prompt = (
+                f"Professional cinematic vertical 9:16 photography, {request.mood} mood, "
+                f"{request.script[:120]}, high detail, 4k, photorealistic, aesthetic composition, "
+                f"dramatic lighting, depth of field"
+            )
+
         encoded_prompt = urllib.parse.quote(refined_prompt)
         seed = uuid.uuid4().int % 10000
         async with httpx.AsyncClient() as client:
