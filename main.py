@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import httpx
 import edge_tts
+import time
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi import Header
 from fastapi.responses import FileResponse, JSONResponse
@@ -85,6 +86,20 @@ def get_audio_duration(file_path, fallback_text=""):
     word_count = len(fallback_text.split())
     return max(3.0, word_count / 2.5) if word_count else 10.0
 
+_VOICE_CACHE = {"ts": 0.0, "voices": set()}
+
+
+async def _get_voice_names(ttl_seconds: int = 6 * 60 * 60) -> set[str]:
+    now = time.time()
+    if _VOICE_CACHE["voices"] and (now - _VOICE_CACHE["ts"]) < ttl_seconds:
+        return _VOICE_CACHE["voices"]
+
+    voices = await edge_tts.list_voices()
+    names = {v.get("ShortName") for v in voices if v.get("ShortName")}
+    _VOICE_CACHE["ts"] = now
+    _VOICE_CACHE["voices"] = names
+    return names
+
 def format_srt_time(seconds):
     hrs = int(seconds // 3600)
     mins = int((seconds % 3600) // 60)
@@ -102,6 +117,15 @@ def create_srt(text, duration, srt_path):
     with open(srt_path, "w", encoding="utf-8") as f:
         for i, chunk in enumerate(chunks):
             f.write(f"{i+1}\n{format_srt_time(i * chunk_duration)} --> {format_srt_time((i + 1) * chunk_duration)}\n{chunk}\n\n")
+
+@app.get("/voices")
+async def voices(x_api_key: str | None = Header(default=None, alias="X-API-Key")):
+    _require_api_key(x_api_key)
+    try:
+        names = await _get_voice_names()
+        return {"voices": sorted(names)}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/")
 def root():
@@ -140,11 +164,24 @@ async def clone_tts(
     _require_api_key(x_api_key)
     if not request.text.strip():
         return JSONResponse({"error": "Text is required"}, status_code=400)
+    if not request.speaker_id.strip():
+        return JSONResponse({"error": "speaker_id is required"}, status_code=400)
     temp_dir = tempfile.mkdtemp()
     filename = os.path.join(temp_dir, "clone.mp3")
     try:
-        # Using a standard voice as fallback for cloning
-        communicate = edge_tts.Communicate(request.text, "en-US-ChristopherNeural")
+        # Pragmatic "clone": treat speaker_id as an Edge TTS voice ShortName.
+        voice = request.speaker_id.strip()
+        voice_names = await _get_voice_names()
+        if voice not in voice_names:
+            return JSONResponse(
+                {
+                    "error": "Unknown speaker_id/voice. Use a valid Edge voice ShortName.",
+                    "example": "en-US-ChristopherNeural",
+                },
+                status_code=400,
+            )
+
+        communicate = edge_tts.Communicate(request.text, voice)
         await communicate.save(filename)
         background_tasks.add_task(cleanup_files, temp_dir)
         return FileResponse(filename, media_type="audio/mpeg", filename="clone_tts.mp3")
