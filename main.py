@@ -240,15 +240,23 @@ async def create_reel(
         if not os.path.exists(ffmpeg_path):
             ffmpeg_path = 'ffmpeg'
 
-        # eq filter darkens background slightly to make text pop; MarginV moves text up
+        # Animated background (Ken Burns): turn 1 image into a subtle moving video, then overlay subtitles.
+        # Keep it lightweight for Render (CPU-only).
+        fps = 30
+        total_frames = max(1, int(duration * fps))
+
+        # Subtle zoom-in. With -loop 1, zoompan will generate `total_frames` frames from the single image.
+        # We scale/crop first to guarantee 9:16, then animate.
         video_filter = (
             "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,"
-            "eq=brightness=-0.1:contrast=1.1,"
+            f"zoompan=z='min(zoom+0.0008,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={total_frames}:fps={fps}:s=720x1280,"
+            "eq=brightness=-0.08:contrast=1.10,"
             "subtitles=subtitles.srt:force_style='Alignment=2,FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=1,MarginV=140'"
         )
         cmd = [
             ffmpeg_path, '-loop', '1', '-i', 'background.jpg', '-i', 'narration.mp3',
             '-vf', video_filter, '-shortest',
+            '-t', str(duration),
             '-c:v', 'libx264', '-preset', 'ultrafast', # 'ultrafast' uses less RAM/CPU
             '-crf', '28', # Higher CRF = lower quality = lower memory
             '-threads', '1', # Limit to 1 thread to save memory
