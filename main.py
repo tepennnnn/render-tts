@@ -7,19 +7,37 @@ import tempfile
 import httpx
 import edge_tts
 from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import Header
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 app = FastAPI(title="VoiceLab TTS Backend")
 
+def _parse_allowed_origins() -> list[str]:
+    raw = os.getenv("VOICELAB_ALLOWED_ORIGINS", "").strip()
+    if not raw:
+        return ["*"]
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+ALLOWED_ORIGINS = _parse_allowed_origins()
+API_KEY = os.getenv("VOICELAB_API_KEY", "").strip()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _require_api_key(x_api_key: str | None):
+    if not API_KEY:
+        return
+    if not x_api_key or x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 class TTSRequest(BaseModel):
     text: str
@@ -94,7 +112,12 @@ def health():
     return {"status": "ok"}
 
 @app.post("/tts")
-async def tts(request: TTSRequest, background_tasks: BackgroundTasks):
+async def tts(
+    request: TTSRequest,
+    background_tasks: BackgroundTasks,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+):
+    _require_api_key(x_api_key)
     if not request.text.strip():
         return JSONResponse({"error": "Text is required"}, status_code=400)
     temp_dir = tempfile.mkdtemp()
@@ -109,7 +132,12 @@ async def tts(request: TTSRequest, background_tasks: BackgroundTasks):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.post("/clone-tts")
-async def clone_tts(request: CloneTTSRequest, background_tasks: BackgroundTasks):
+async def clone_tts(
+    request: CloneTTSRequest,
+    background_tasks: BackgroundTasks,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+):
+    _require_api_key(x_api_key)
     if not request.text.strip():
         return JSONResponse({"error": "Text is required"}, status_code=400)
     temp_dir = tempfile.mkdtemp()
@@ -125,7 +153,12 @@ async def clone_tts(request: CloneTTSRequest, background_tasks: BackgroundTasks)
         return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.post("/reel")
-async def create_reel(request: ReelRequest, background_tasks: BackgroundTasks):
+async def create_reel(
+    request: ReelRequest,
+    background_tasks: BackgroundTasks,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+):
+    _require_api_key(x_api_key)
     if not request.script.strip():
         return JSONResponse({"error": "Script is required"}, status_code=400)
 
