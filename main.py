@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import subprocess
 import urllib.parse
@@ -7,6 +8,8 @@ import tempfile
 import httpx
 import edge_tts
 import time
+import hashlib
+import struct
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi import Header
 from fastapi.responses import FileResponse, JSONResponse
@@ -55,6 +58,10 @@ class ReelRequest(BaseModel):
     rate: str = "-10%"
     pitch: str = "-5Hz"
     image_description: str = None
+    # Paste a Google Fonts stylesheet URL here, for example:
+    # https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap
+    # We rewrite it server-side to request TTF-compatible faces for FFmpeg subtitles.
+    google_font_css_url: str | None = None
 
 def cleanup_files(*files):
     for file in files:
@@ -100,6 +107,203 @@ async def _get_voice_names(ttl_seconds: int = 6 * 60 * 60) -> set[str]:
     _VOICE_CACHE["voices"] = names
     return names
 
+_GOOGLE_CSS_HOST_ALLOWLIST = frozenset({"fonts.googleapis.com", "fonts.gstatic.com"})
+_USER_AGENT_CSS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
+)
+
+
+def _assert_allowed_font_url(url: str) -> None:
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    scheme = (parsed.scheme or "").lower()
+    if scheme != "https":
+        raise ValueError("Font URLs must use https")
+    if host not in _GOOGLE_CSS_HOST_ALLOWLIST:
+        raise ValueError("Only Google Fonts hosts are allowed (fonts.googleapis.com, fonts.gstatic.com)")
+
+
+def _extract_font_face_blocks(css_text: str) -> list[dict[str, str]]:
+    blocks: list[dict[str, str]] = []
+    for m in re.finditer(r"@font-face\s*\{([^}]+)\}", css_text, flags=re.IGNORECASE | re.DOTALL):
+        body = m.group(1)
+        fam_m = re.search(r"font-family\s*:\s*(['\"]?)([^;'\"]+)\1\s*;", body, flags=re.IGNORECASE)
+        src_m = re.search(r"src\s*:\s*([^;]+);", body, flags=re.IGNORECASE)
+        if not src_m:
+            continue
+        family = fam_m.group(2).strip() if fam_m else ""
+        src = src_m.group(1).strip()
+        blocks.append({"family": family, "src": src})
+    return blocks
+
+
+def _pick_ttf_url_from_src(src: str, base_url: str) -> str | None:
+    # Prefer explicit url("...ttf") patterns
+    for um in re.finditer(r"url\(([^)]+)\)", src):
+        raw = um.group(1).strip().strip('"').strip("'")
+        if not raw:
+            continue
+        if raw.lower().endswith(".ttf"):
+            full = urllib.parse.urljoin(base_url, raw)
+            return full
+    return None
+
+
+async def _download_bytes(client: httpx.AsyncClient, url: str, headers: dict[str, str] | None = None) -> bytes:
+    _assert_allowed_font_url(url)
+    merged = {"User-Agent": _USER_AGENT_CSS}
+    if headers:
+        merged.update(headers)
+    resp = await client.get(url, timeout=60.0, headers=merged)
+    resp.raise_for_status()
+    return resp.content
+
+
+def _read_ttf_name_family(ttf_path: str) -> str | None:
+    """
+    Minimal TrueType/OpenType name-table reader: returns Name ID 1 (Font Family).
+    Enough for subtitles Fontname matching in libass/ffmpeg.
+    """
+    try:
+        with open(ttf_path, "rb") as f:
+            data = f.read()
+        if len(data) < 12:
+            return None
+
+        scaler = struct.unpack(">I", data[0:4])[0]
+        if scaler == 0x00010000:
+            num_tables = struct.unpack(">H", data[4:6])[0]
+            offset = 12
+            for _ in range(num_tables):
+                if offset + 16 > len(data):
+                    break
+                tag = data[offset:offset + 4].decode("ascii", errors="ignore")
+                rec_off = struct.unpack(">I", data[offset + 8:offset + 12])[0]
+                if tag == "name":
+                    if rec_off + 6 > len(data):
+                        return None
+                    count = struct.unpack(">H", data[rec_off + 2 : rec_off + 4])[0]
+                    stroff = struct.unpack(">H", data[rec_off + 4 : rec_off + 6])[0] + rec_off
+                    pos = rec_off + 6
+                    for _i in range(count):
+                        if pos + 12 > len(data):
+                            return None
+                        platform_id = struct.unpack(">H", data[pos : pos + 2])[0]
+                        encoding_id = struct.unpack(">H", data[pos + 2 : pos + 4])[0]
+                        name_id = struct.unpack(">H", data[pos + 6 : pos + 8])[0]
+                        length = struct.unpack(">H", data[pos + 8 : pos + 10])[0]
+                        string_off = struct.unpack(">H", data[pos + 10 : pos + 12])[0]
+                        pos += 12
+                        if name_id != 1:
+                            continue
+                        s_pos = stroff + string_off
+                        s_bytes = data[s_pos : s_pos + length]
+
+                        # Common cases: UCS-2BE (platform 3 encodings), or Macintosh Roman (ASCII-ish)
+                        try:
+                            if platform_id == 3:  # Windows
+                                return s_bytes.decode("utf_16_be", errors="ignore").strip() or None
+                            if platform_id == 1:  # Macintosh
+                                return s_bytes.decode("latin-1", errors="ignore").strip() or None
+                            # Fallback
+                            return s_bytes.decode("utf_16_be", errors="ignore").strip() or None
+                        except Exception:
+                            return None
+                    return None
+                offset += 16
+            return None
+        return None
+    except Exception:
+        return None
+
+
+def _finalize_downloaded_font(font_path: str, fallback_family_from_css: str, filename_for_fallback: str) -> tuple[str, str | None]:
+    internal = _read_ttf_name_family(font_path)
+    if internal:
+        return internal, "fonts"
+    fallback = (fallback_family_from_css or "").strip() or os.path.splitext(filename_for_fallback)[0]
+    return fallback, "fonts"
+
+
+async def prepare_google_font_for_subtitles(css_url: str, dest_dir: str) -> tuple[str, str | None]:
+    """
+    Returns (font_family_name_for_ass, fontsdir_relative_or_none).
+    Downloads a .ttf into dest_dir/fonts and points libass via ffmpeg subtitles=...:fontsdir=fonts
+
+    Raises ValueError with a user-actionable message on failure.
+    """
+    stripped = css_url.strip()
+    if not stripped:
+        raise ValueError("Empty google_font_css_url")
+
+    _assert_allowed_font_url(stripped)
+    parsed_css = urllib.parse.urlparse(stripped)
+    hostname = (parsed_css.hostname or "").lower()
+    os.makedirs(dest_dir, exist_ok=True)
+    fonts_subdir = os.path.join(dest_dir, "fonts")
+    os.makedirs(fonts_subdir, exist_ok=True)
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        # Direct font file shortcut (often easiest / most reliable for FFmpeg).
+        if hostname == "fonts.gstatic.com" and stripped.lower().endswith(".ttf"):
+            font_bytes = await _download_bytes(client, stripped)
+            digest = hashlib.sha256(font_bytes).hexdigest()[:12]
+            filename = os.path.basename(parsed_css.path) or f"{digest}.ttf"
+            if not filename.lower().endswith(".ttf"):
+                filename = f"{digest}.ttf"
+            font_path = os.path.join(fonts_subdir, filename)
+            with open(font_path, "wb") as f:
+                f.write(font_bytes)
+            font_name, fontsdir_rel = _finalize_downloaded_font(font_path, fallback_family_from_css="", filename_for_fallback=filename)
+            return font_name, fontsdir_rel
+
+        if hostname != "fonts.googleapis.com":
+            raise ValueError(
+                "Paste either:\n"
+                "- a Google Fonts **CSS** link from fonts.googleapis.com, or\n"
+                "- a direct **.ttf** link from fonts.gstatic.com"
+            )
+
+        # Google's CSS differs by User-Agent; this UA tends to yield legacy stacks that include usable TTF.
+        css_headers = {
+            "User-Agent": _USER_AGENT_CSS,
+            "Accept": "text/css,*/*;q=0.1",
+        }
+        css_bytes = await _download_bytes(client, stripped, headers=css_headers)
+        css_text = css_bytes.decode("utf-8", errors="replace")
+
+        blocks = _extract_font_face_blocks(css_text)
+        ttf_url = None
+        family = ""
+        for b in blocks:
+            u = _pick_ttf_url_from_src(b["src"], stripped)
+            if u:
+                ttf_url = u
+                family = b["family"] or ""
+                break
+
+        if not ttf_url:
+            raise ValueError(
+                "Could not find a downloadable .ttf in the Google Fonts CSS response "
+                "(Google may have only returned woff2). "
+                "Try a different Google Font, or paste a direct **.ttf** URL from fonts.gstatic.com "
+                '(often visible as `url(https://fonts.gstatic.com/.../*.ttf)` in the CSS response).'
+            )
+
+        font_bytes = await _download_bytes(client, ttf_url)
+        digest = hashlib.sha256(font_bytes).hexdigest()[:12]
+        filename = os.path.basename(urllib.parse.urlparse(ttf_url).path) or "font.ttf"
+        if not filename.lower().endswith(".ttf"):
+            filename = f"{digest}.ttf"
+        font_path = os.path.join(fonts_subdir, filename)
+        with open(font_path, "wb") as f:
+            f.write(font_bytes)
+
+    font_name, fontsdir_rel = _finalize_downloaded_font(font_path, fallback_family_from_css=family, filename_for_fallback=filename)
+    return font_name, fontsdir_rel
+
+
 def format_srt_time(seconds):
     hrs = int(seconds // 3600)
     mins = int((seconds % 3600) // 60)
@@ -139,7 +343,14 @@ def create_srt(text, duration, srt_path):
         for i, chunk in enumerate(chunks):
             f.write(f"{i+1}\n{format_srt_time(i * chunk_duration)} --> {format_srt_time((i + 1) * chunk_duration)}\n{chunk}\n\n")
 
-def create_ass(text: str, duration: float, ass_path: str):
+def create_ass(
+    text: str,
+    duration: float,
+    ass_path: str,
+    font_name_override: str | None = None,
+    font_size_override: int | None = None,
+    margin_v_override: int | None = None,
+):
     """
     ASS subtitles let us control font and add simple per-line animation.
     We generate evenly-timed chunks (same as SRT), and apply a subtle fade to each line.
@@ -153,9 +364,9 @@ def create_ass(text: str, duration: float, ass_path: str):
         chunks.append(" ".join(words[index:index + 7]))
     chunk_duration = duration / len(chunks)
 
-    font_name = os.getenv("VOICELAB_SUB_FONT", "Arial").strip() or "Arial"
-    font_size = int(os.getenv("VOICELAB_SUB_FONT_SIZE", "46"))
-    margin_v = int(os.getenv("VOICELAB_SUB_MARGIN_V", "140"))
+    font_name = (font_name_override or os.getenv("VOICELAB_SUB_FONT", "Arial")).strip() or "Arial"
+    font_size = font_size_override if font_size_override is not None else int(os.getenv("VOICELAB_SUB_FONT_SIZE", "46"))
+    margin_v = margin_v_override if margin_v_override is not None else int(os.getenv("VOICELAB_SUB_MARGIN_V", "140"))
 
     header = f"""[Script Info]
 ScriptType: v4.00+
@@ -298,7 +509,18 @@ async def create_reel(
         duration = get_audio_duration(audio_path, request.script)
 
         # 3. Subtitles (ASS) - supports font + simple animation.
-        create_ass(request.script, duration, ass_path)
+        font_override: str | None = None
+        fontsdir_opt = ""
+        gf = (request.google_font_css_url or "").strip()
+        if gf:
+            font_override, fontsdir_rel = await prepare_google_font_for_subtitles(gf, temp_dir)
+            if fontsdir_rel:
+                # Path is relative to ffmpeg cwd (temp_dir)
+                fontsdir_opt = f":fontsdir={fontsdir_rel}"
+
+        create_ass(request.script, duration, ass_path, font_name_override=font_override)
+
+        subtitles_filter = f"subtitles=subtitles.ass{fontsdir_opt}"
 
         # 4. Video Assembly (FFmpeg with Visual Optimization)
         ffmpeg_path = os.path.join(os.getcwd(), "ffmpeg_bin", "ffmpeg")
@@ -316,7 +538,7 @@ async def create_reel(
             "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,"
             f"zoompan=z='min(zoom+0.0008,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={total_frames}:fps={fps}:s=720x1280,"
             "eq=brightness=-0.08:contrast=1.10,"
-            "subtitles=subtitles.ass"
+            + subtitles_filter
         )
         cmd = [
             ffmpeg_path, '-loop', '1', '-i', 'background.jpg', '-i', 'narration.mp3',
@@ -337,6 +559,9 @@ async def create_reel(
         background_tasks.add_task(cleanup_files, temp_dir)
         return FileResponse(output_path, media_type="video/mp4", filename="reel.mp4")
 
+    except ValueError as e:
+        cleanup_files(temp_dir)
+        return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:
         cleanup_files(temp_dir)
         return JSONResponse({"error": str(e)}, status_code=500)
