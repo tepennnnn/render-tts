@@ -107,6 +107,27 @@ def format_srt_time(seconds):
     millis = int((seconds % 1) * 1000)
     return f"{hrs:02d}:{mins:02d}:{secs:02d},{millis:03d}"
 
+def _format_ass_time(seconds: float) -> str:
+    # ASS time format: H:MM:SS.CC (centiseconds)
+    if seconds < 0:
+        seconds = 0.0
+    hrs = int(seconds // 3600)
+    mins = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    cs = int((seconds % 1) * 100)  # centiseconds
+    return f"{hrs}:{mins:02d}:{secs:02d}.{cs:02d}"
+
+
+def _ass_escape(text: str) -> str:
+    # Basic escaping for libass
+    return (
+        text.replace("\\", r"\\")
+        .replace("{", r"\{")
+        .replace("}", r"\}")
+        .replace("\n", r"\N")
+    )
+
+
 def create_srt(text, duration, srt_path):
     words = text.split()
     if not words: return
@@ -117,6 +138,50 @@ def create_srt(text, duration, srt_path):
     with open(srt_path, "w", encoding="utf-8") as f:
         for i, chunk in enumerate(chunks):
             f.write(f"{i+1}\n{format_srt_time(i * chunk_duration)} --> {format_srt_time((i + 1) * chunk_duration)}\n{chunk}\n\n")
+
+def create_ass(text: str, duration: float, ass_path: str):
+    """
+    ASS subtitles let us control font and add simple per-line animation.
+    We generate evenly-timed chunks (same as SRT), and apply a subtle fade to each line.
+    """
+    words = text.split()
+    if not words:
+        return
+
+    chunks = []
+    for index in range(0, len(words), 7):
+        chunks.append(" ".join(words[index:index + 7]))
+    chunk_duration = duration / len(chunks)
+
+    font_name = os.getenv("VOICELAB_SUB_FONT", "Arial").strip() or "Arial"
+    font_size = int(os.getenv("VOICELAB_SUB_FONT_SIZE", "46"))
+    margin_v = int(os.getenv("VOICELAB_SUB_MARGIN_V", "140"))
+
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: 720
+PlayResY: 1280
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,{font_name},{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,0,2,60,60,{margin_v},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(header)
+        for i, chunk in enumerate(chunks):
+            start = i * chunk_duration
+            end = (i + 1) * chunk_duration
+            # Fade in/out (ms). Keep subtle so it feels premium, not flashy.
+            line = _ass_escape(chunk)
+            text_with_fx = r"{\fad(180,220)}" + line
+            f.write(
+                f"Dialogue: 0,{_format_ass_time(start)},{_format_ass_time(end)},Default,,0,0,0,,{text_with_fx}\n"
+            )
 
 @app.get("/voices")
 async def voices(x_api_key: str | None = Header(default=None, alias="X-API-Key")):
@@ -202,7 +267,7 @@ async def create_reel(
     temp_dir = tempfile.mkdtemp()
     audio_path = os.path.join(temp_dir, "narration.mp3")
     image_path = os.path.join(temp_dir, "background.jpg")
-    srt_path = os.path.join(temp_dir, "subtitles.srt")
+    ass_path = os.path.join(temp_dir, "subtitles.ass")
     output_path = os.path.join(temp_dir, "reel.mp4")
 
     try:
@@ -232,8 +297,8 @@ async def create_reel(
         await communicate.save(audio_path)
         duration = get_audio_duration(audio_path, request.script)
 
-        # 3. Subtitles (SRT)
-        create_srt(request.script, duration, srt_path)
+        # 3. Subtitles (ASS) - supports font + simple animation.
+        create_ass(request.script, duration, ass_path)
 
         # 4. Video Assembly (FFmpeg with Visual Optimization)
         ffmpeg_path = os.path.join(os.getcwd(), "ffmpeg_bin", "ffmpeg")
@@ -251,7 +316,7 @@ async def create_reel(
             "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,"
             f"zoompan=z='min(zoom+0.0008,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={total_frames}:fps={fps}:s=720x1280,"
             "eq=brightness=-0.08:contrast=1.10,"
-            "subtitles=subtitles.srt:force_style='Alignment=2,FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=1,MarginV=140'"
+            "subtitles=subtitles.ass"
         )
         cmd = [
             ffmpeg_path, '-loop', '1', '-i', 'background.jpg', '-i', 'narration.mp3',
