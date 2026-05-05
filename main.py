@@ -123,6 +123,37 @@ def _assert_allowed_font_url(url: str) -> None:
     if host not in _GOOGLE_CSS_HOST_ALLOWLIST:
         raise ValueError("Only Google Fonts hosts are allowed (fonts.googleapis.com, fonts.gstatic.com)")
 
+def _normalize_google_font_input(url: str) -> str:
+    """
+    Accept:
+    - fonts.googleapis.com/css2?... (preferred)
+    - fonts.gstatic.com/...ttf (direct)
+    - fonts.google.com/specimen/<Family> (user-friendly page URL)
+    """
+    parsed = urllib.parse.urlparse(url.strip())
+    host = (parsed.hostname or "").lower()
+
+    if host in {"fonts.googleapis.com", "fonts.gstatic.com"}:
+        return url.strip()
+
+    if host == "fonts.google.com":
+        path = parsed.path or ""
+        if "/specimen/" in path:
+            family_raw = path.split("/specimen/", 1)[1].split("/", 1)[0].strip()
+            if family_raw:
+                family = family_raw.replace("+", " ").replace("%20", " ").strip()
+                family_q = family.replace(" ", "+")
+                return f"https://fonts.googleapis.com/css2?family={family_q}&display=swap"
+        raise ValueError(
+            "Unsupported fonts.google.com link. Please use a specific family page like "
+            "https://fonts.google.com/specimen/Inter or paste a fonts.googleapis.com CSS URL."
+        )
+
+    raise ValueError(
+        "Unsupported font link. Paste a Google Fonts CSS URL (fonts.googleapis.com), "
+        "a direct .ttf link (fonts.gstatic.com), or a fonts.google.com/specimen/<Family> link."
+    )
+
 
 def _extract_font_face_blocks(css_text: str) -> list[dict[str, str]]:
     blocks: list[dict[str, str]] = []
@@ -233,7 +264,7 @@ async def prepare_google_font_for_subtitles(css_url: str, dest_dir: str) -> tupl
 
     Raises ValueError with a user-actionable message on failure.
     """
-    stripped = css_url.strip()
+    stripped = _normalize_google_font_input(css_url.strip())
     if not stripped:
         raise ValueError("Empty google_font_css_url")
 
