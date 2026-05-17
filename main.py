@@ -74,10 +74,64 @@ _SCENE_PREP_SEM: asyncio.Semaphore | None = None
 
 
 def _scene_prep_sem() -> asyncio.Semaphore:
+    """Serialize Pollinations calls — parallel requests trigger 429 on cloud hosts."""
     global _SCENE_PREP_SEM
     if _SCENE_PREP_SEM is None:
-        _SCENE_PREP_SEM = asyncio.Semaphore(4)
+        _SCENE_PREP_SEM = asyncio.Semaphore(1)
     return _SCENE_PREP_SEM
+
+
+_POLLINATIONS_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+}
+
+_MOOD_FALLBACK_COLORS = {
+    "cinematic": "0x1a1a2e",
+    "dark motivational": "0x0d0d12",
+    "peaceful": "0x2d4a3e",
+    "luxury success": "0x1c1510",
+    "gym discipline": "0x1a0f0f",
+    "business mindset": "0x141820",
+}
+
+
+def _scene_image_delay_seconds() -> float:
+    try:
+        return max(0.0, float(os.getenv("VOICELAB_SCENE_IMAGE_DELAY", "3.0")))
+    except ValueError:
+        return 3.0
+
+
+def _pollinations_max_retries() -> int:
+    try:
+        return max(1, int(os.getenv("VOICELAB_IMAGE_MAX_RETRIES", "5")))
+    except ValueError:
+        return 5
+
+
+def _is_valid_image_bytes(data: bytes) -> bool:
+    if len(data) < 2048:
+        return False
+    if data[:3] == b"\xff\xd8\xff":
+        return True
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return True
+    if data[:4] == b"RIFF" and len(data) > 12 and data[8:12] == b"WEBP":
+        return True
+    return False
+
+
+def _create_fallback_scene_image(dest_path: str, temp_dir: str, mood: str) -> None:
+    color = _MOOD_FALLBACK_COLORS.get(mood.strip().lower(), "0x1a1a2e")
+    _run_ffmpeg([
+        "ffmpeg", "-f", "lavfi", "-i", f"color=c={color}:s=720x1280",
+        "-frames:v", "1", "-q:v", "2", "-y", os.path.basename(dest_path),
+    ], temp_dir)
+    print(f"WARNING: Using fallback color plate for scene ({mood})")
 
 def cleanup_files(*files):
     for file in files:
@@ -133,7 +187,7 @@ def _run_ffmpeg(cmd: list[str], cwd: str) -> None:
     elif binary == "ffprobe":
         cmd[0] = _ffprobe_path()
     process = subprocess.run(
-        cmd, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=300,
+        cmd, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=600,
     )
     if process.returncode != 0:
         detail = (process.stderr or "").strip()[-400:]
@@ -504,15 +558,55 @@ def _scene_image_prompt(mood: str, line: str, image_description: str | None) -> 
     )
 
 
-async def _fetch_pollinations_image(client: httpx.AsyncClient, prompt: str, dest_path: str) -> None:
-    encoded_prompt = urllib.parse.quote(prompt)
+async def _fetch_pollinations_image(
+    client: httpx.AsyncClient,
+    prompt: str,
+    dest_path: str,
+    *,
+    temp_dir: str | None = None,
+    mood: str = "Cinematic",
+    allow_fallback: bool = True,
+) -> None:
+    encoded_prompt = urllib.parse.quote(prompt[:500])
     seed = uuid.uuid4().int % 10000
-    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=720&height=1280&nologo=true&seed={seed}"
-    resp = await client.get(url, timeout=90.0)
-    if resp.status_code != 200:
-        raise Exception("Image generation failed")
-    with open(dest_path, "wb") as f:
-        f.write(resp.content)
+    url = (
+        f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+        f"?width=720&height=1280&nologo=true&seed={seed}&enhance=false"
+    )
+    max_retries = _pollinations_max_retries()
+    last_error = "unknown error"
+
+    for attempt in range(max_retries):
+        try:
+            resp = await client.get(url, headers=_POLLINATIONS_HEADERS, timeout=120.0)
+            if resp.status_code == 200 and _is_valid_image_bytes(resp.content):
+                with open(dest_path, "wb") as f:
+                    f.write(resp.content)
+                return
+            last_error = f"HTTP {resp.status_code}, {len(resp.content)} bytes"
+            if resp.status_code in (429, 500, 502, 503, 504, 408):
+                wait = min(45.0, 2.0 * (2 ** attempt))
+                print(f"Pollinations retry {attempt + 1}/{max_retries} ({last_error}), wait {wait:.0f}s")
+                await asyncio.sleep(wait)
+                continue
+            break
+        except httpx.TimeoutException:
+            last_error = "timeout"
+            wait = min(45.0, 2.0 * (2 ** attempt))
+            print(f"Pollinations timeout retry {attempt + 1}/{max_retries}, wait {wait:.0f}s")
+            await asyncio.sleep(wait)
+        except httpx.HTTPError as e:
+            last_error = str(e)
+            await asyncio.sleep(min(30.0, 2.0 * (2 ** attempt)))
+
+    if allow_fallback and temp_dir:
+        _create_fallback_scene_image(dest_path, temp_dir, mood)
+        return
+
+    raise Exception(
+        f"Image generation failed ({last_error}). "
+        "Pollinations may be rate-limiting this server — try again in a minute or use fewer lines."
+    )
 
 
 def create_ass_scenes(
@@ -634,13 +728,14 @@ async def _prepare_scene(
     image_path = os.path.join(temp_dir, image_name)
     audio_path = os.path.join(temp_dir, audio_name)
 
+    prompt = _scene_image_prompt(mood, line, image_description)
+    communicate = edge_tts.Communicate(line, voice, rate=rate, pitch=pitch)
+
     async with _scene_prep_sem():
-        prompt = _scene_image_prompt(mood, line, image_description)
-        communicate = edge_tts.Communicate(line, voice, rate=rate, pitch=pitch)
-        await asyncio.gather(
-            _fetch_pollinations_image(client, prompt, image_path),
-            communicate.save(audio_path),
+        await _fetch_pollinations_image(
+            client, prompt, image_path, temp_dir=temp_dir, mood=mood,
         )
+    await communicate.save(audio_path)
     duration = get_audio_duration(audio_path, line)
     return index, image_name, audio_name, duration
 
@@ -656,14 +751,18 @@ async def _build_multi_scene_reel(
     pitch = request.pitch if request.pitch else "-5Hz"
     fps = 30
 
-    async with httpx.AsyncClient() as client:
-        prepared = await asyncio.gather(*[
-            _prepare_scene(
+    timeout = httpx.Timeout(connect=30.0, read=150.0, write=30.0, pool=30.0)
+    prepared: list[tuple[int, str, str, float]] = []
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        delay = _scene_image_delay_seconds()
+        for i, line in enumerate(scenes):
+            if i > 0 and delay > 0:
+                await asyncio.sleep(delay)
+            print(f"DEBUG: Preparing scene {i + 1}/{len(scenes)}")
+            prepared.append(await _prepare_scene(
                 i, line, client, temp_dir, request.mood, request.voice,
                 rate, pitch, request.image_description,
-            )
-            for i, line in enumerate(scenes)
-        ])
+            ))
 
     prepared.sort(key=lambda x: x[0])
     audio_files = [p[2] for p in prepared]
@@ -726,11 +825,13 @@ async def _build_single_scene_reel(
     rate = request.rate if request.rate else "-10%"
     pitch = request.pitch if request.pitch else "-5Hz"
 
-    async with httpx.AsyncClient() as client:
-        await asyncio.gather(
-            _fetch_pollinations_image(client, refined_prompt, image_path),
-            edge_tts.Communicate(script, request.voice, rate=rate, pitch=pitch).save(audio_path),
+    timeout = httpx.Timeout(connect=30.0, read=150.0, write=30.0, pool=30.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        await _fetch_pollinations_image(
+            client, refined_prompt, image_path,
+            temp_dir=temp_dir, mood=request.mood,
         )
+        await edge_tts.Communicate(script, request.voice, rate=rate, pitch=pitch).save(audio_path)
 
     duration = get_audio_duration(audio_path, script)
 
