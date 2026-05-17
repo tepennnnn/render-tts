@@ -1,8 +1,11 @@
 import asyncio
 import os
 import re
+import shutil
+import sys
 import uuid
 import subprocess
+import traceback
 import urllib.parse
 import shutil
 import tempfile
@@ -67,7 +70,14 @@ class ReelRequest(BaseModel):
 
 MAX_REEL_SCENES = 12
 MIN_SCENES_FOR_MULTI = 2
-_SCENE_PREP_SEM = asyncio.Semaphore(4)
+_SCENE_PREP_SEM: asyncio.Semaphore | None = None
+
+
+def _scene_prep_sem() -> asyncio.Semaphore:
+    global _SCENE_PREP_SEM
+    if _SCENE_PREP_SEM is None:
+        _SCENE_PREP_SEM = asyncio.Semaphore(4)
+    return _SCENE_PREP_SEM
 
 def cleanup_files(*files):
     for file in files:
@@ -80,14 +90,40 @@ def cleanup_files(*files):
         except Exception as e:
             print(f"Error deleting {file}: {e}")
 
+def _resolve_tool(name: str) -> str:
+    """Resolve ffmpeg/ffprobe: project ffmpeg_bin (incl. .exe on Windows), then PATH."""
+    bin_dir = os.path.join(os.getcwd(), "ffmpeg_bin")
+    candidates = [name]
+    if sys.platform == "win32":
+        candidates = [f"{name}.exe", name]
+    for candidate in candidates:
+        local = os.path.join(bin_dir, candidate)
+        if os.path.isfile(local):
+            return local
+    found = shutil.which(name)
+    if found:
+        return found
+    if sys.platform == "win32":
+        found = shutil.which(f"{name}.exe")
+        if found:
+            return found
+    raise FileNotFoundError(
+        f"{name} not found. Install FFmpeg and add it to PATH, or place {name}.exe in ffmpeg_bin/ "
+        f"(see https://ffmpeg.org/download.html)."
+    )
+
+
 def _ffmpeg_path() -> str:
-    path = os.path.join(os.getcwd(), "ffmpeg_bin", "ffmpeg")
-    return path if os.path.exists(path) else "ffmpeg"
+    return _resolve_tool("ffmpeg")
 
 
 def _ffprobe_path() -> str:
-    path = os.path.join(os.getcwd(), "ffmpeg_bin", "ffprobe")
-    return path if os.path.exists(path) else "ffprobe"
+    return _resolve_tool("ffprobe")
+
+
+def _ensure_ffmpeg_tools() -> None:
+    _ffmpeg_path()
+    _ffprobe_path()
 
 
 def _run_ffmpeg(cmd: list[str], cwd: str) -> None:
@@ -525,7 +561,29 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 def _write_concat_list(filenames: list[str], list_path: str) -> None:
     with open(list_path, "w", encoding="utf-8") as f:
         for name in filenames:
-            f.write(f"file '{name}'\n")
+            # Use forward slashes so FFmpeg concat demuxer works on Windows.
+            safe = name.replace("\\", "/")
+            f.write(f"file '{safe}'\n")
+
+
+def _concat_audio_segments(segment_names: list[str], output_name: str, temp_dir: str) -> None:
+    list_path = os.path.join(temp_dir, "audio_concat.txt")
+    _write_concat_list(segment_names, list_path)
+    # Re-encode: edge-tts MP3 segments often fail with stream copy concat.
+    _run_ffmpeg([
+        "ffmpeg", "-f", "concat", "-safe", "0", "-i", "audio_concat.txt",
+        "-c:a", "aac", "-b:a", "128k", "-y", output_name,
+    ], temp_dir)
+
+
+def _concat_video_segments(segment_names: list[str], output_name: str, temp_dir: str) -> None:
+    list_path = os.path.join(temp_dir, "video_concat.txt")
+    _write_concat_list(segment_names, list_path)
+    _run_ffmpeg([
+        "ffmpeg", "-f", "concat", "-safe", "0", "-i", "video_concat.txt",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+        "-pix_fmt", "yuv420p", "-an", "-y", output_name,
+    ], temp_dir)
 
 
 def _zoompan_filter(motion: bool, total_frames: int, fps: int) -> str:
@@ -576,7 +634,7 @@ async def _prepare_scene(
     image_path = os.path.join(temp_dir, image_name)
     audio_path = os.path.join(temp_dir, audio_name)
 
-    async with _SCENE_PREP_SEM:
+    async with _scene_prep_sem():
         prompt = _scene_image_prompt(mood, line, image_description)
         communicate = edge_tts.Communicate(line, voice, rate=rate, pitch=pitch)
         await asyncio.gather(
@@ -593,6 +651,7 @@ async def _build_multi_scene_reel(
     temp_dir: str,
     output_path: str,
 ) -> None:
+    _ensure_ffmpeg_tools()
     rate = request.rate if request.rate else "-10%"
     pitch = request.pitch if request.pitch else "-5Hz"
     fps = 30
@@ -610,13 +669,7 @@ async def _build_multi_scene_reel(
     audio_files = [p[2] for p in prepared]
     durations = [p[3] for p in prepared]
 
-    narration_path = os.path.join(temp_dir, "narration.mp3")
-    audio_list_path = os.path.join(temp_dir, "audio_concat.txt")
-    _write_concat_list(audio_files, audio_list_path)
-    _run_ffmpeg([
-        "ffmpeg", "-f", "concat", "-safe", "0", "-i", "audio_concat.txt",
-        "-c", "copy", "-y", "narration.mp3",
-    ], temp_dir)
+    _concat_audio_segments(audio_files, "narration.m4a", temp_dir)
 
     ass_path = os.path.join(temp_dir, "subtitles.ass")
     font_override: str | None = None
@@ -635,17 +688,11 @@ async def _build_multi_scene_reel(
         _render_scene_clip(f"scene_{i}.jpg", dur, request.motion, clip_name, temp_dir, fps)
         clip_names.append(clip_name)
 
-    video_list_path = os.path.join(temp_dir, "video_concat.txt")
-    _write_concat_list(clip_names, video_list_path)
-    video_only = "video_only.mp4"
-    _run_ffmpeg([
-        "ffmpeg", "-f", "concat", "-safe", "0", "-i", "video_concat.txt",
-        "-c", "copy", "-y", video_only,
-    ], temp_dir)
+    _concat_video_segments(clip_names, "video_only.mp4", temp_dir)
 
     subtitles_filter = f"subtitles=subtitles.ass{fontsdir_opt}"
     _run_ffmpeg([
-        "ffmpeg", "-i", video_only, "-i", "narration.mp3",
+        "ffmpeg", "-i", "video_only.mp4", "-i", "narration.m4a",
         "-vf", subtitles_filter,
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-threads", "1",
         "-c:a", "aac", "-b:a", "96k", "-pix_fmt", "yuv420p", "-shortest",
@@ -659,6 +706,7 @@ async def _build_single_scene_reel(
     temp_dir: str,
     output_path: str,
 ) -> None:
+    _ensure_ffmpeg_tools()
     audio_path = os.path.join(temp_dir, "narration.mp3")
     image_path = os.path.join(temp_dir, "background.jpg")
     ass_path = os.path.join(temp_dir, "subtitles.ass")
@@ -827,7 +875,11 @@ async def create_reel(
     except ValueError as e:
         cleanup_files(temp_dir)
         return JSONResponse({"error": str(e)}, status_code=400)
+    except FileNotFoundError as e:
+        cleanup_files(temp_dir)
+        return JSONResponse({"error": str(e)}, status_code=500)
     except Exception as e:
+        traceback.print_exc()
         cleanup_files(temp_dir)
         return JSONResponse({"error": str(e)}, status_code=500)
 
