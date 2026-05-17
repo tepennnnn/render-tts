@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="VoiceLab TTS Backend")
+app = FastAPI(title="Reels TTS generator Backend")
 
 def _parse_allowed_origins() -> list[str]:
     raw = os.getenv("VOICELAB_ALLOWED_ORIGINS", "").strip()
@@ -58,6 +58,7 @@ class ReelRequest(BaseModel):
     rate: str = "-10%"
     pitch: str = "-5Hz"
     image_description: str = None
+    motion: bool = True
     # Paste a Google Fonts stylesheet URL here, for example:
     # https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap
     # We rewrite it server-side to request TTF-compatible faces for FFmpeg subtitles.
@@ -436,7 +437,7 @@ async def voices(x_api_key: str | None = Header(default=None, alias="X-API-Key")
 
 @app.get("/")
 def root():
-    return {"status": "VoiceLab backend is running"}
+    return {"status": "Reels TTS generator backend is running"}
 
 @app.get("/health")
 def health():
@@ -503,6 +504,7 @@ async def create_reel(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ):
     _require_api_key(x_api_key)
+    print(f"DEBUG: Creating reel. Motion enabled: {request.motion}")
     if not request.script.strip():
         return JSONResponse({"error": "Script is required"}, status_code=400)
 
@@ -558,19 +560,25 @@ async def create_reel(
         if not os.path.exists(ffmpeg_path):
             ffmpeg_path = 'ffmpeg'
 
-        # Animated background (Ken Burns): turn 1 image into a subtle moving video, then overlay subtitles.
-        # Keep it lightweight for Render (CPU-only).
         fps = 30
         total_frames = max(1, int(duration * fps))
 
-        # Subtle zoom-in. With -loop 1, zoompan will generate `total_frames` frames from the single image.
-        # We scale/crop first to guarantee 9:16, then animate.
-        video_filter = (
-            "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,"
-            f"zoompan=z='min(zoom+0.0008,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={total_frames}:fps={fps}:s=720x1280,"
-            "eq=brightness=-0.08:contrast=1.10,"
-            + subtitles_filter
-        )
+        # Build filter chain cleanly
+        filters = [
+            "scale=720:1280:force_original_aspect_ratio=increase",
+            "crop=720:1280"
+        ]
+
+        if request.motion:
+            # Add Ken Burns zoom effect
+            filters.append(f"zoompan=z='min(zoom+0.0008,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={total_frames}:fps={fps}:s=720x1280")
+        else:
+            # Explicitly force a static zoom to ensure no motion occurs with the looped image
+            filters.append(f"zoompan=z=1:d={total_frames}:fps={fps}:s=720x1280")
+        filters.append(subtitles_filter)
+
+        video_filter = ",".join(filters)
+
         cmd = [
             ffmpeg_path, '-loop', '1', '-i', 'background.jpg', '-i', 'narration.mp3',
             '-vf', video_filter, '-shortest',
