@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import uuid
@@ -64,6 +65,10 @@ class ReelRequest(BaseModel):
     # We rewrite it server-side to request TTF-compatible faces for FFmpeg subtitles.
     google_font_css_url: str | None = None
 
+MAX_REEL_SCENES = 12
+MIN_SCENES_FOR_MULTI = 2
+_SCENE_PREP_SEM = asyncio.Semaphore(4)
+
 def cleanup_files(*files):
     for file in files:
         try:
@@ -75,17 +80,38 @@ def cleanup_files(*files):
         except Exception as e:
             print(f"Error deleting {file}: {e}")
 
-def get_audio_duration(file_path, fallback_text=""):
-    # Path to local ffprobe
-    ffprobe_path = os.path.join(os.getcwd(), "ffmpeg_bin", "ffprobe")
-    if not os.path.exists(ffprobe_path):
-        ffprobe_path = 'ffprobe' # Fallback to system path
+def _ffmpeg_path() -> str:
+    path = os.path.join(os.getcwd(), "ffmpeg_bin", "ffmpeg")
+    return path if os.path.exists(path) else "ffmpeg"
 
+
+def _ffprobe_path() -> str:
+    path = os.path.join(os.getcwd(), "ffmpeg_bin", "ffprobe")
+    return path if os.path.exists(path) else "ffprobe"
+
+
+def _run_ffmpeg(cmd: list[str], cwd: str) -> None:
+    binary = cmd[0]
+    if binary == "ffmpeg":
+        cmd[0] = _ffmpeg_path()
+    elif binary == "ffprobe":
+        cmd[0] = _ffprobe_path()
+    process = subprocess.run(
+        cmd, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=300,
+    )
+    if process.returncode != 0:
+        detail = (process.stderr or "").strip()[-400:]
+        raise Exception(f"FFmpeg failed{f': {detail}' if detail else ''}")
+
+
+def get_audio_duration(file_path, fallback_text=""):
     try:
         cmd = [
-            ffprobe_path, '-v', 'error', '-show_entries', 'format=duration',
+            "ffprobe", '-v', 'error', '-show_entries', 'format=duration',
             '-of', 'default=noprint_wrappers=1:nokey=1', file_path
         ]
+        ffprobe = _ffprobe_path()
+        cmd[0] = ffprobe
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
         if result.returncode == 0:
             return float(result.stdout.strip())
@@ -426,6 +452,269 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 f"Dialogue: 0,{_format_ass_time(start)},{_format_ass_time(end)},Default,,0,0,0,,{text_with_fx}\n"
             )
 
+
+def split_script_scenes(script: str) -> list[str]:
+    return [ln.strip() for ln in script.splitlines() if ln.strip()]
+
+
+def _scene_image_prompt(mood: str, line: str, image_description: str | None) -> str:
+    style = ""
+    if image_description and image_description.strip():
+        style = f"{image_description.strip()}, "
+    return (
+        f"Professional cinematic vertical 9:16 photography, {style}{mood} mood, "
+        f"scene depicting: {line[:200]}, high detail, 4k, photorealistic, "
+        f"aesthetic composition, dramatic lighting, depth of field"
+    )
+
+
+async def _fetch_pollinations_image(client: httpx.AsyncClient, prompt: str, dest_path: str) -> None:
+    encoded_prompt = urllib.parse.quote(prompt)
+    seed = uuid.uuid4().int % 10000
+    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=720&height=1280&nologo=true&seed={seed}"
+    resp = await client.get(url, timeout=90.0)
+    if resp.status_code != 200:
+        raise Exception("Image generation failed")
+    with open(dest_path, "wb") as f:
+        f.write(resp.content)
+
+
+def create_ass_scenes(
+    lines: list[str],
+    durations: list[float],
+    ass_path: str,
+    font_name_override: str | None = None,
+    font_size_override: int | None = None,
+    margin_v_override: int | None = None,
+):
+    """One subtitle line per scene, timed to each segment's narration duration."""
+    if not lines or len(lines) != len(durations):
+        return
+
+    font_name = (font_name_override or os.getenv("VOICELAB_SUB_FONT", "Arial")).strip() or "Arial"
+    font_size = font_size_override if font_size_override is not None else int(os.getenv("VOICELAB_SUB_FONT_SIZE", "46"))
+    margin_v = margin_v_override if margin_v_override is not None else int(os.getenv("VOICELAB_SUB_MARGIN_V", "140"))
+
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: 720
+PlayResY: 1280
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,{font_name},{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,0,2,60,60,{margin_v},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    t = 0.0
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(header)
+        for line, dur in zip(lines, durations):
+            start = t
+            end = t + dur
+            t = end
+            text_with_fx = r"{\fad(180,220)}" + _ass_escape(line)
+            f.write(
+                f"Dialogue: 0,{_format_ass_time(start)},{_format_ass_time(end)},Default,,0,0,0,,{text_with_fx}\n"
+            )
+
+
+def _write_concat_list(filenames: list[str], list_path: str) -> None:
+    with open(list_path, "w", encoding="utf-8") as f:
+        for name in filenames:
+            f.write(f"file '{name}'\n")
+
+
+def _zoompan_filter(motion: bool, total_frames: int, fps: int) -> str:
+    if motion:
+        return (
+            f"zoompan=z='min(zoom+0.0008,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+            f":d={total_frames}:fps={fps}:s=720x1280"
+        )
+    return f"zoompan=z=1:d={total_frames}:fps={fps}:s=720x1280"
+
+
+def _render_scene_clip(
+    image_name: str,
+    duration: float,
+    motion: bool,
+    out_name: str,
+    temp_dir: str,
+    fps: int = 30,
+) -> None:
+    total_frames = max(1, int(duration * fps))
+    vf = ",".join([
+        "scale=720:1280:force_original_aspect_ratio=increase",
+        "crop=720:1280",
+        _zoompan_filter(motion, total_frames, fps),
+    ])
+    _run_ffmpeg([
+        "ffmpeg", "-loop", "1", "-i", image_name,
+        "-vf", vf, "-t", str(duration), "-r", str(fps),
+        "-pix_fmt", "yuv420p", "-an",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-threads", "1",
+        "-y", out_name,
+    ], temp_dir)
+
+
+async def _prepare_scene(
+    index: int,
+    line: str,
+    client: httpx.AsyncClient,
+    temp_dir: str,
+    mood: str,
+    voice: str,
+    rate: str,
+    pitch: str,
+    image_description: str | None,
+) -> tuple[int, str, str, float]:
+    image_name = f"scene_{index}.jpg"
+    audio_name = f"seg_{index}.mp3"
+    image_path = os.path.join(temp_dir, image_name)
+    audio_path = os.path.join(temp_dir, audio_name)
+
+    async with _SCENE_PREP_SEM:
+        prompt = _scene_image_prompt(mood, line, image_description)
+        communicate = edge_tts.Communicate(line, voice, rate=rate, pitch=pitch)
+        await asyncio.gather(
+            _fetch_pollinations_image(client, prompt, image_path),
+            communicate.save(audio_path),
+        )
+    duration = get_audio_duration(audio_path, line)
+    return index, image_name, audio_name, duration
+
+
+async def _build_multi_scene_reel(
+    request: ReelRequest,
+    scenes: list[str],
+    temp_dir: str,
+    output_path: str,
+) -> None:
+    rate = request.rate if request.rate else "-10%"
+    pitch = request.pitch if request.pitch else "-5Hz"
+    fps = 30
+
+    async with httpx.AsyncClient() as client:
+        prepared = await asyncio.gather(*[
+            _prepare_scene(
+                i, line, client, temp_dir, request.mood, request.voice,
+                rate, pitch, request.image_description,
+            )
+            for i, line in enumerate(scenes)
+        ])
+
+    prepared.sort(key=lambda x: x[0])
+    audio_files = [p[2] for p in prepared]
+    durations = [p[3] for p in prepared]
+
+    narration_path = os.path.join(temp_dir, "narration.mp3")
+    audio_list_path = os.path.join(temp_dir, "audio_concat.txt")
+    _write_concat_list(audio_files, audio_list_path)
+    _run_ffmpeg([
+        "ffmpeg", "-f", "concat", "-safe", "0", "-i", "audio_concat.txt",
+        "-c", "copy", "-y", "narration.mp3",
+    ], temp_dir)
+
+    ass_path = os.path.join(temp_dir, "subtitles.ass")
+    font_override: str | None = None
+    fontsdir_opt = ""
+    gf = (request.google_font_css_url or "").strip()
+    if gf:
+        font_override, fontsdir_rel = await prepare_google_font_for_subtitles(gf, temp_dir)
+        if fontsdir_rel:
+            fontsdir_opt = f":fontsdir={fontsdir_rel}"
+
+    create_ass_scenes(scenes, durations, ass_path, font_name_override=font_override)
+
+    clip_names: list[str] = []
+    for i, dur in enumerate(durations):
+        clip_name = f"clip_{i}.mp4"
+        _render_scene_clip(f"scene_{i}.jpg", dur, request.motion, clip_name, temp_dir, fps)
+        clip_names.append(clip_name)
+
+    video_list_path = os.path.join(temp_dir, "video_concat.txt")
+    _write_concat_list(clip_names, video_list_path)
+    video_only = "video_only.mp4"
+    _run_ffmpeg([
+        "ffmpeg", "-f", "concat", "-safe", "0", "-i", "video_concat.txt",
+        "-c", "copy", "-y", video_only,
+    ], temp_dir)
+
+    subtitles_filter = f"subtitles=subtitles.ass{fontsdir_opt}"
+    _run_ffmpeg([
+        "ffmpeg", "-i", video_only, "-i", "narration.mp3",
+        "-vf", subtitles_filter,
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-threads", "1",
+        "-c:a", "aac", "-b:a", "96k", "-pix_fmt", "yuv420p", "-shortest",
+        "-y", "reel.mp4",
+    ], temp_dir)
+
+
+async def _build_single_scene_reel(
+    request: ReelRequest,
+    script: str,
+    temp_dir: str,
+    output_path: str,
+) -> None:
+    audio_path = os.path.join(temp_dir, "narration.mp3")
+    image_path = os.path.join(temp_dir, "background.jpg")
+    ass_path = os.path.join(temp_dir, "subtitles.ass")
+
+    if request.image_description and request.image_description.strip():
+        refined_prompt = (
+            f"Professional cinematic vertical 9:16 photography, {request.image_description}, "
+            f"high detail, 4k, photorealistic, aesthetic composition"
+        )
+    else:
+        refined_prompt = (
+            f"Professional cinematic vertical 9:16 photography, {request.mood} mood, "
+            f"{script[:120]}, high detail, 4k, photorealistic, aesthetic composition, "
+            f"dramatic lighting, depth of field"
+        )
+
+    rate = request.rate if request.rate else "-10%"
+    pitch = request.pitch if request.pitch else "-5Hz"
+
+    async with httpx.AsyncClient() as client:
+        await asyncio.gather(
+            _fetch_pollinations_image(client, refined_prompt, image_path),
+            edge_tts.Communicate(script, request.voice, rate=rate, pitch=pitch).save(audio_path),
+        )
+
+    duration = get_audio_duration(audio_path, script)
+
+    font_override: str | None = None
+    fontsdir_opt = ""
+    gf = (request.google_font_css_url or "").strip()
+    if gf:
+        font_override, fontsdir_rel = await prepare_google_font_for_subtitles(gf, temp_dir)
+        if fontsdir_rel:
+            fontsdir_opt = f":fontsdir={fontsdir_rel}"
+
+    create_ass(script, duration, ass_path, font_name_override=font_override)
+    subtitles_filter = f"subtitles=subtitles.ass{fontsdir_opt}"
+
+    fps = 30
+    total_frames = max(1, int(duration * fps))
+    filters = [
+        "scale=720:1280:force_original_aspect_ratio=increase",
+        "crop=720:1280",
+        _zoompan_filter(request.motion, total_frames, fps),
+        subtitles_filter,
+    ]
+    video_filter = ",".join(filters)
+
+    _run_ffmpeg([
+        "ffmpeg", "-loop", "1", "-i", "background.jpg", "-i", "narration.mp3",
+        "-vf", video_filter, "-shortest", "-t", str(duration),
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-threads", "1",
+        "-c:a", "aac", "-b:a", "96k", "-pix_fmt", "yuv420p", "-y", "reel.mp4",
+    ], temp_dir)
+
+
 @app.get("/voices")
 async def voices(x_api_key: str | None = Header(default=None, alias="X-API-Key")):
     _require_api_key(x_api_key)
@@ -504,96 +793,33 @@ async def create_reel(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ):
     _require_api_key(x_api_key)
-    print(f"DEBUG: Creating reel. Motion enabled: {request.motion}")
     if not request.script.strip():
         return JSONResponse({"error": "Script is required"}, status_code=400)
 
+    scenes = split_script_scenes(request.script)
+    if len(scenes) > MAX_REEL_SCENES:
+        return JSONResponse(
+            {
+                "error": (
+                    f"Multi-scene reels support up to {MAX_REEL_SCENES} lines "
+                    f"(one AI image per line). You have {len(scenes)}."
+                ),
+            },
+            status_code=400,
+        )
+
+    multi = len(scenes) >= MIN_SCENES_FOR_MULTI
+    print(f"DEBUG: Creating reel. scenes={len(scenes)} multi={multi} motion={request.motion}")
+
     temp_dir = tempfile.mkdtemp()
-    audio_path = os.path.join(temp_dir, "narration.mp3")
-    image_path = os.path.join(temp_dir, "background.jpg")
-    ass_path = os.path.join(temp_dir, "subtitles.ass")
     output_path = os.path.join(temp_dir, "reel.mp4")
 
     try:
-        # 1. Image Generation (Optimized Prompt + Random Seed)
-        if request.image_description and request.image_description.strip():
-            refined_prompt = f"Professional cinematic vertical 9:16 photography, {request.image_description}, high detail, 4k, photorealistic, aesthetic composition"
+        if multi:
+            await _build_multi_scene_reel(request, scenes, temp_dir, output_path)
         else:
-            refined_prompt = (
-                f"Professional cinematic vertical 9:16 photography, {request.mood} mood, "
-                f"{request.script[:120]}, high detail, 4k, photorealistic, aesthetic composition, "
-                f"dramatic lighting, depth of field"
-            )
-
-        encoded_prompt = urllib.parse.quote(refined_prompt)
-        seed = uuid.uuid4().int % 10000
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=720&height=1280&nologo=true&seed={seed}", timeout=60.0)
-            if resp.status_code != 200: raise Exception("Image generation failed")
-            with open(image_path, "wb") as f: f.write(resp.content)
-
-        # 2. TTS Generation (Adjusted Pace and Pitch)
-        # Using parameters from request with fallbacks
-        rate = request.rate if request.rate else "-10%"
-        pitch = request.pitch if request.pitch else "-5Hz"
-
-        communicate = edge_tts.Communicate(request.script, request.voice, rate=rate, pitch=pitch)
-        await communicate.save(audio_path)
-        duration = get_audio_duration(audio_path, request.script)
-
-        # 3. Subtitles (ASS) - supports font + simple animation.
-        font_override: str | None = None
-        fontsdir_opt = ""
-        gf = (request.google_font_css_url or "").strip()
-        if gf:
-            font_override, fontsdir_rel = await prepare_google_font_for_subtitles(gf, temp_dir)
-            if fontsdir_rel:
-                # Path is relative to ffmpeg cwd (temp_dir)
-                fontsdir_opt = f":fontsdir={fontsdir_rel}"
-
-        create_ass(request.script, duration, ass_path, font_name_override=font_override)
-
-        subtitles_filter = f"subtitles=subtitles.ass{fontsdir_opt}"
-
-        # 4. Video Assembly (FFmpeg with Visual Optimization)
-        ffmpeg_path = os.path.join(os.getcwd(), "ffmpeg_bin", "ffmpeg")
-        if not os.path.exists(ffmpeg_path):
-            ffmpeg_path = 'ffmpeg'
-
-        fps = 30
-        total_frames = max(1, int(duration * fps))
-
-        # Build filter chain cleanly
-        filters = [
-            "scale=720:1280:force_original_aspect_ratio=increase",
-            "crop=720:1280"
-        ]
-
-        if request.motion:
-            # Add Ken Burns zoom effect
-            filters.append(f"zoompan=z='min(zoom+0.0008,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={total_frames}:fps={fps}:s=720x1280")
-        else:
-            # Explicitly force a static zoom to ensure no motion occurs with the looped image
-            filters.append(f"zoompan=z=1:d={total_frames}:fps={fps}:s=720x1280")
-        filters.append(subtitles_filter)
-
-        video_filter = ",".join(filters)
-
-        cmd = [
-            ffmpeg_path, '-loop', '1', '-i', 'background.jpg', '-i', 'narration.mp3',
-            '-vf', video_filter, '-shortest',
-            '-t', str(duration),
-            '-c:v', 'libx264', '-preset', 'ultrafast', # 'ultrafast' uses less RAM/CPU
-            '-crf', '28', # Higher CRF = lower quality = lower memory
-            '-threads', '1', # Limit to 1 thread to save memory
-            '-c:a', 'aac', '-b:a', '96k',
-            '-pix_fmt', 'yuv420p', '-y', 'reel.mp4'
-        ]
-
-        # Don't capture output in memory (save RAM)
-        process = subprocess.run(cmd, cwd=temp_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if process.returncode != 0:
-            raise Exception("FFmpeg failed to generate video.")
+            script = scenes[0] if scenes else request.script.strip()
+            await _build_single_scene_reel(request, script, temp_dir, output_path)
 
         background_tasks.add_task(cleanup_files, temp_dir)
         return FileResponse(output_path, media_type="video/mp4", filename="reel.mp4")
